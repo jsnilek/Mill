@@ -256,30 +256,93 @@ const ease = x => x * x * (3 - 2 * x);
 
 // Bean pile: remember each bean's original matrix + relative height (0 bottom .. 1 top).
 const beanMesh = grinder.beans.userData.mesh;
+// Each bean: rest rank height h (0 bottom .. 1 top; negative = consumed), radial fraction u of the
+// cone radius, angle, and a current height y that eases toward its target (per-bean lag).
+const Y_BOT = BODY_TOP + 0.45, Y_TOP = BODY_TOP + 0.3 + 1.8, SPAN = Y_TOP - Y_BOT;
+const coneLimit = y => { // allowed bean-center radius at height y (hopper cone minus bean size)
+  const f = Math.min(1, Math.max(0, (y - (BODY_TOP + 0.3)) / 2.3));
+  return Math.max(1.2 + 0.7 * f - 0.2, 0.1);
+};
 const beanBase = [];
 {
   const m = new THREE.Matrix4(), p = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
-  let minY = Infinity, maxY = -Infinity;
   for (let i = 0; i < beanMesh.count; i++) {
     beanMesh.getMatrixAt(i, m);
     m.decompose(p, q, s);
-    beanBase.push({ p: p.clone(), q: q.clone(), s: s.clone(), h: 0 });
-    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+    const h = (p.y - Y_BOT) / SPAN;
+    beanBase.push({
+      q0: q.clone(), s: s.clone(), h, h0: h, gone: false,
+      u: Math.min(1, Math.hypot(p.x, p.z) / coneLimit(p.y)), ang: Math.atan2(p.z, p.x),
+      y: p.y, tgt: p.y, k: 5 + Math.random() * 6, wait: 0, vel: 0, falling: false,
+      axis: new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize(),
+      omega: (Math.random() < 0.5 ? -1 : 1) * (1 + Math.random() * 1.5),
+      ph: Math.random() * 6.283,
+    });
   }
-  for (const b of beanBase) b.h = (b.p.y - minY) / (maxY - minY);
 }
-const _m = new THREE.Matrix4(), _s = new THREE.Vector3();
-// Hide beans above the level; beans near the surface shrink out so the pile lowers smoothly.
-function applyBeansLevel(level) {
-  const soft = 0.04;
+const _m = new THREE.Matrix4(), _s = new THREE.Vector3(), _p = new THREE.Vector3(),
+  _q = new THREE.Quaternion(), _qa = new THREE.Quaternion();
+let beansMoving = false;
+// Advance bean motion. off = pile lowering (in h units) during a grind; always rewrites matrices.
+function stepBeans(dt, off = 0) {
+  let moving = false;
   for (let i = 0; i < beanBase.length; i++) {
     const b = beanBase[i];
-    const k = level <= 0 ? 0 : Math.min(1, Math.max(0, (level * (1 + soft) - b.h) / soft));
-    _s.copy(b.s).multiplyScalar(Math.max(k, 1e-5));
-    _m.compose(b.p, b.q, _s);
+    let scale = 1;
+    b.tgt = Y_BOT + Math.max(b.h - off, -0.2) * SPAN;
+    if (b.wait > 0) { // refill bean still waiting above the hopper
+      b.wait -= dt; moving = true; scale = 0;
+    } else if (b.falling) {
+      b.vel += 9 * dt; b.y -= b.vel * dt; moving = true;
+      if (b.y <= b.tgt) { b.y = b.tgt; b.falling = false; b.vel = 0; }
+    } else {
+      const d = b.tgt - b.y;
+      if (Math.abs(d) > 5e-4) { b.y += d * (1 - Math.exp(-b.k * dt)); moving = true; }
+      else b.y = b.tgt;
+    }
+    const y = b.y;
+    if (b.wait > 0 || (b.gone && y <= Y_BOT - 0.3)) scale = 0;
+    else scale = Math.min(1, Math.max(0, (y - (Y_BOT - 0.3)) / 0.3)); // vanish into the burrs
+    // radius: fraction of the cone radius at this height; squeezed toward the center at the burr opening
+    const sq = Math.min(1, Math.max(0, (y - (Y_BOT - 0.3)) / 0.7));
+    const lim = coneLimit(y);
+    const r0 = b.u * lim * (0.25 + 0.75 * sq * sq * (3 - 2 * sq));
+    let x = Math.cos(b.ang) * r0 + Math.sin(y * 13 + b.ph) * 0.035;
+    let z = Math.sin(b.ang) * r0 + Math.cos(y * 11 + b.ph) * 0.035;
+    const rr = Math.hypot(x, z);
+    if (rr > lim) { x *= lim / rr; z *= lim / rr; }
+    _qa.setFromAxisAngle(b.axis, y * b.omega);
+    _q.copy(b.q0).multiply(_qa);
+    _s.copy(b.s).multiplyScalar(Math.max(scale, 1e-5));
+    _m.compose(_p.set(x, y, z), _q, _s);
     beanMesh.setMatrixAt(i, _m);
   }
   beanMesh.instanceMatrix.needsUpdate = true;
+  beansMoving = moving;
+}
+function snapBeans() { // jump to rest state
+  for (const b of beanBase) { b.y = Y_BOT + Math.max(b.h, -0.2) * SPAN; b.wait = 0; b.falling = false; }
+  stepBeans(0);
+}
+function beginGrindBeans() { for (const b of beanBase) b.h0 = b.h; }
+function endGrindBeans(delta) {
+  for (const b of beanBase) { b.h -= delta; if (b.h < 0) b.gone = true; }
+}
+// Consumed beans re-enter above the hopper and fall into slots on top of the remaining pile.
+function beginRefillBeans() {
+  let top = 0, n = 0;
+  for (const b of beanBase) { if (b.gone) n++; else top = Math.max(top, b.h); }
+  let j = 0;
+  for (const b of beanBase) {
+    if (!b.gone) continue;
+    b.h = top + ((j + 0.5) / n) * (1 - top);
+    b.gone = false;
+    const slotY = Y_BOT + b.h * SPAN;
+    b.y = Math.max(slotY, Y_TOP) + 0.4 + Math.random() * 1.0;
+    b.wait = (j / n) * 0.65 * REFILL_TIME + Math.random() * 0.08;
+    b.falling = true; b.vel = 0;
+    j++;
+  }
 }
 function applyGroundsLevel(level, radial = 1) {
   grinder.groundsMesh.scale.set(radial, Math.max(level * grinder.groundsMaxHeight, 0.0001), radial);
@@ -314,6 +377,7 @@ function startGrind() {
   state.groundsFrom = state.groundsLevel; // old grounds, cleared at the start of this grind
   state.delta = Math.min(GRIND_AMOUNT, state.beansLevel);
   state.groundsTarget = GROUNDS_PER_GRIND * state.delta / GRIND_AMOUNT;
+  beginGrindBeans();
   particles.visible = true;
   refreshUI();
 }
@@ -322,6 +386,7 @@ function startRefill() {
   state.mode = 'refilling'; state.t = 0;
   state.from = state.beansLevel;
   state.delta = 1 - state.beansLevel;
+  beginRefillBeans();
   refreshUI();
 }
 
@@ -347,7 +412,7 @@ function update(dt, time) {
     shake = env;
     const prog = ease(p);
     state.beansLevel = state.from - state.delta * prog;
-    applyBeansLevel(state.beansLevel);
+    stepBeans(dt, state.delta * prog);
     if (state.t < GROUNDS_FADE) { // old grounds vanish quickly
       const f = ease(state.t / GROUNDS_FADE);
       state.groundsLevel = state.groundsFrom * (1 - f);
@@ -361,6 +426,7 @@ function update(dt, time) {
     if (p >= 1) {
       state.mode = 'idle';
       state.beansLevel = Math.max(0, state.from - state.delta);
+      endGrindBeans(state.delta);
       state.groundsLevel = state.groundsTarget;
       applyGroundsLevel(state.groundsLevel);
       particles.visible = false;
@@ -370,8 +436,10 @@ function update(dt, time) {
     state.t += dt;
     const p = Math.min(state.t / REFILL_TIME, 1);
     state.beansLevel = state.from + state.delta * ease(p);
-    applyBeansLevel(state.beansLevel);
+    stepBeans(dt);
     if (p >= 1) { state.mode = 'idle'; state.beansLevel = 1; refreshUI(); }
+  } else if (beansMoving) {
+    stepBeans(dt); // let beans finish settling after the action ends
   }
   state.spin += spinSpeed * dt;
   grinder.burrs.userData.ring.rotation.y = state.spin;
@@ -383,7 +451,7 @@ function update(dt, time) {
 
 grindBtn.addEventListener('click', startGrind);
 refillBtn.addEventListener('click', startRefill);
-applyBeansLevel(state.beansLevel);
+snapBeans();
 applyGroundsLevel(state.groundsLevel);
 refreshUI();
 const clock = new THREE.Clock();
