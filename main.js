@@ -121,6 +121,29 @@ function buildHopper() {
   return hopper;
 }
 
+// Domed lid resting on the hopper rim. Local origin = underside of the lip (rim top y).
+const LID_Y = BODY_TOP + 0.3 + 2.3 + 0.04;
+const lidMat = new THREE.MeshStandardMaterial({ color: 0x1d1d21, roughness: 0.35, metalness: 0.25 });
+function buildLid() {
+  const lid = new THREE.Group();
+  const lip = new THREE.Mesh(new THREE.CylinderGeometry(1.94, 1.94, 0.12, 48), lidMat);
+  lip.position.y = 0.06;
+  lid.add(lip);
+  const a = 1.9, h = 0.38, R = (a * a + h * h) / (2 * h);
+  const dome = new THREE.Mesh(new THREE.SphereGeometry(R, 64, 12, 0, Math.PI * 2, 0, Math.asin(a / R)), lidMat);
+  dome.position.y = 0.12 + h - R;
+  lid.add(dome);
+  const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.14, 0.16, 20), metalMat);
+  stem.position.y = 0.12 + h + 0.06;
+  const knob = new THREE.Mesh(new THREE.SphereGeometry(0.22, 24, 16), lidMat);
+  knob.scale.y = 0.8;
+  knob.position.y = 0.12 + h + 0.22;
+  lid.add(stem, knob);
+  lid.traverse(o => { if (o.isMesh) o.castShadow = o.receiveShadow = true; });
+  lid.position.set(0, LID_Y, 0);
+  return lid;
+}
+
 // One coffee bean: ellipsoid (long axis x, flat side up +y) with a carved center crease.
 function makeBeanGeometry() {
   const geo = new THREE.SphereGeometry(1, 36, 24);
@@ -218,12 +241,13 @@ const hopper = buildHopper();
 const beans = buildBeans();
 const chute = buildChute();
 const bin = buildBin();
-grinder.add(base, body, burrs, hopper, beans, chute, bin);
+const lid = buildLid();
+grinder.add(base, body, burrs, hopper, beans, chute, bin, lid);
 grinder.traverse(o => { if (o.isMesh && o.material !== glassMat) o.receiveShadow = true; });
 
 // Handles for task 2 animations
 Object.assign(grinder, {
-  parts: { base, body, hopper, chute, bin },
+  parts: { base, body, hopper, chute, bin, lid },
   burrs,                          // group; burrs.userData.ring is the spinnable ring
   beans,                          // group; beans.userData.mesh is the InstancedMesh
   groundsMesh: bin.userData.grounds, // scale.y = fill height (0..groundsMaxHeight)
@@ -307,11 +331,32 @@ const BAG_HOVER = new THREE.Vector3(1.0, 6.4, 0);
 const BAG_POUR = new THREE.Vector3(0.45, 5.95, 0); // mouth position while pouring
 const mouthPos = new THREE.Vector3();
 // Choreography timeline (seconds): enter, tilt, pour, tilt back, leave (ends at REFILL_TIME).
-const T_ENTER = 0.7, T_TILT = 1.15, T_POUR_END = 2.1, T_BACK = 2.65;
+// Times below are bag-local; the bag starts at BAG_START in the refill timeline (after the lid is lifted away).
+const T_ENTER = 0.7, T_TILT = 1.15, T_POUR_END = 2.1, T_BACK = 2.65, T_BAG_END = 3.2;
+const BAG_START = 0.9;
+// Lid choreography (refill-time seconds): lift, slide aside, [bag works], slide back, lower.
+const LID_LIFT = 0.8, L1 = 0.5, L2 = 1.4, L3 = 3.75, L4 = 4.6;
+const LID_ASIDE = new THREE.Vector3(-3.6, LID_Y + 1.0, 1.0); // hovering screen-left, clear of pour path
+const LID_ASIDE_ROT = new THREE.Vector3(0.1, 0.5, 0.5);      // x, y, z tilt
+function updateLid(t) {
+  const up = LID_Y + LID_LIFT, A = LID_ASIDE, R = LID_ASIDE_ROT;
+  const place = k => { // k: 0 = above hopper, 1 = aside
+    lid.position.set(A.x * k, up + (A.y - up) * k + 0.25 * Math.sin(Math.PI * k), A.z * k);
+    lid.rotation.set(R.x * k, R.y * k, R.z * k);
+  };
+  if (t < L1) { lid.position.set(0, LID_Y + LID_LIFT * ease(t / L1), 0); lid.rotation.set(0, 0, 0); }
+  else if (t < L2) place(ease((t - L1) / (L2 - L1)));
+  else if (t < L3) { place(1); lid.position.y += 0.04 * Math.sin(t * 3); }
+  else if (t < L4) place(1 - ease((t - L3) / (L4 - L3)));
+  else { const k = ease(Math.min(1, (t - L4) / (REFILL_TIME - L4))); lid.position.set(0, up - LID_LIFT * k, 0); lid.rotation.set(0, 0, 0); }
+}
+function resetLid() { lid.position.set(0, LID_Y, 0); lid.rotation.set(0, 0, 0); }
 const POUR_ANGLE = 2.2;
 const seg = (t, a, b) => ease(Math.min(1, Math.max(0, (t - a) / (b - a))));
-function updateBag(t) {
-  const e = seg(t, 0, T_ENTER), tl = seg(t, T_ENTER, T_TILT), bk = seg(t, T_POUR_END, T_BACK), lv = seg(t, T_BACK, REFILL_TIME);
+function updateBag(tt) {
+  const t = tt - BAG_START;
+  if (t < 0) { bag.visible = false; return; }
+  const e = seg(t, 0, T_ENTER), tl = seg(t, T_ENTER, T_TILT), bk = seg(t, T_POUR_END, T_BACK), lv = seg(t, T_BACK, T_BAG_END);
   const pr = Math.min(1, Math.max(0, (t - T_TILT) / (T_POUR_END - T_TILT)));
   bag.visible = true;
   if (t < T_ENTER) bag.position.lerpVectors(BAG_AWAY, BAG_HOVER, e);
@@ -331,7 +376,7 @@ const refillBtn = document.getElementById('refill');
 const statusEl = document.getElementById('status');
 
 // ---------- Simulation state ----------
-const GRIND_TIME = 3, REFILL_TIME = 3.2, GRIND_AMOUNT = 0.2, MAX_SPIN = 14; // rad/s
+const GRIND_TIME = 3, REFILL_TIME = 5.0, GRIND_AMOUNT = 0.2, MAX_SPIN = 14; // rad/s
 const GROUNDS_FADE = 0.3, GROUNDS_PER_GRIND = 0.6; // old grounds fade time (s); bin fill of a full grind
 const state = {
   mode: 'idle',        // 'idle' | 'grinding' | 'refilling'
@@ -438,7 +483,7 @@ function beginRefillBeans() {
     b.gone = false;
     const slotY = Y_BOT + b.h * SPAN;
     b.y = Math.max(slotY, Y_TOP) + 0.4 + Math.random() * 1.0;
-    b.wait = T_TILT + 0.08 + (j / n) * (T_POUR_END - T_TILT - 0.15) + Math.random() * 0.05;
+    b.wait = BAG_START + T_TILT + 0.08 + (j / n) * (T_POUR_END - T_TILT - 0.15) + Math.random() * 0.05;
     b.falling = true; b.vel = 0;
     j++;
   }
@@ -536,9 +581,10 @@ function update(dt, time) {
     state.t += dt;
     const p = Math.min(state.t / REFILL_TIME, 1);
     state.beansLevel = state.from + state.delta * ease(p);
+    updateLid(state.t);
     updateBag(state.t);
     stepBeans(dt);
-    if (p >= 1) { hideBag(); state.mode = 'idle'; state.beansLevel = 1; refreshUI(); }
+    if (p >= 1) { hideBag(); resetLid(); state.mode = 'idle'; state.beansLevel = 1; refreshUI(); }
   } else if (beansMoving) {
     stepBeans(dt); // let beans finish settling after the action ends
   }
