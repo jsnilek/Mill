@@ -371,14 +371,15 @@ function updateParticles(time) {
 }
 
 function startGrind() {
-  if (state.mode !== 'idle' || state.beansLevel <= 0) return;
+  if (state.mode !== 'idle') return;
   state.mode = 'grinding'; state.t = 0;
-  state.from = state.beansLevel;
+  state.from = Math.max(0, state.beansLevel);
   state.groundsFrom = state.groundsLevel; // old grounds, cleared at the start of this grind
-  state.delta = Math.min(GRIND_AMOUNT, state.beansLevel);
+  state.delta = Math.min(GRIND_AMOUNT, state.from); // only what is available; 0 when empty
+  if (state.delta < 0.0005) state.delta = 0;
   state.groundsTarget = GROUNDS_PER_GRIND * state.delta / GRIND_AMOUNT;
   beginGrindBeans();
-  particles.visible = true;
+  particles.visible = state.delta > 0;
   refreshUI();
 }
 function startRefill() {
@@ -393,12 +394,12 @@ function startRefill() {
 function refreshUI() {
   const idle = state.mode === 'idle';
   const empty = state.beansLevel <= 0.0005;
-  grindBtn.disabled = !idle || empty;
+  grindBtn.disabled = !idle;
   refillBtn.disabled = !idle || state.beansLevel >= 1;
   statusEl.textContent =
     state.mode === 'grinding' ? 'Grinding…' :
     state.mode === 'refilling' ? 'Refilling…' :
-    empty ? (state.groundsLevel > 0 ? 'Grounds ready – hopper empty, refill' : 'Hopper empty – refill') :
+    empty ? (state.groundsLevel > 0 ? 'Grounds ready – hopper empty, refill or grind empty' : 'Hopper empty – refill or grind empty') :
     state.groundsLevel > 0 ? 'Grounds ready – grind again to replace' : 'Ready';
 }
 
@@ -422,7 +423,7 @@ function update(dt, time) {
       state.groundsLevel = state.groundsTarget * r;
       applyGroundsLevel(state.groundsLevel);
     }
-    updateParticles(time);
+    if (state.delta > 0) updateParticles(time);
     if (p >= 1) {
       state.mode = 'idle';
       state.beansLevel = Math.max(0, state.from - state.delta);
