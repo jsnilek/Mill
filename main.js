@@ -55,7 +55,7 @@ const glassMat = new THREE.MeshPhysicalMaterial({
 });
 const bodyMat = new THREE.MeshStandardMaterial({ color: 0x2f2f33, roughness: 0.45, metalness: 0.4 });
 const metalMat = new THREE.MeshStandardMaterial({ color: 0xb5b8bd, roughness: 0.3, metalness: 0.9 });
-const beanMat = new THREE.MeshStandardMaterial({ color: 0x4a2a14, roughness: 0.6 });
+const beanMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.4, metalness: 0.05, vertexColors: true });
 const groundsMat = new THREE.MeshStandardMaterial({ color: 0x2b1a10, roughness: 1 });
 
 // ---------- Parts ----------
@@ -121,26 +121,55 @@ function buildHopper() {
   return hopper;
 }
 
+// One coffee bean: ellipsoid (long axis x, flat side up +y) with a carved center crease.
+function makeBeanGeometry() {
+  const geo = new THREE.SphereGeometry(1, 36, 24);
+  const A = 0.15, B = 0.095, C = 0.065; // half length, half width (z), half thickness (y)
+  const pos = geo.attributes.position;
+  const col = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), z = pos.getZ(i);
+    let y = pos.getY(i);
+    // crease: pull the upper surface down near z = 0, fading out toward the bean tips
+    const g = Math.exp(-Math.pow(z / 0.16, 2));
+    const tip = Math.max(0, 1 - Math.pow(Math.abs(x), 3));
+    const pull = y > 0 ? 0.8 * g * tip : 0;
+    if (y > 0) y *= 1 - pull;
+    const wob = y > 0 ? Math.sin(x * 3.2) * 0.012 * g : 0; // slight S-curve of the slit
+    pos.setXYZ(i, x * A, y * C, z * B + wob);
+    const dark = 1 - 0.65 * pull; // darker inside the crease
+    col[i * 3] = col[i * 3 + 1] = col[i * 3 + 2] = dark;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
 // Beans as one InstancedMesh packed inside the hopper's cone.
-function buildBeans(count = 450) {
+function buildBeans(count = 560) {
   const beans = new THREE.Group();
-  const geo = new THREE.SphereGeometry(0.12, 12, 8);
-  geo.scale(1, 0.65, 0.75);
+  const geo = makeBeanGeometry();
   const mesh = new THREE.InstancedMesh(geo, beanMat, count);
   mesh.castShadow = true;
   const yBottom = BODY_TOP + 0.45, yTop = BODY_TOP + 0.3 + 1.8;
   const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
+  const dark = new THREE.Color(0x2a140a), mid = new THREE.Color(0x6b3d20), c = new THREE.Color();
   for (let i = 0; i < count; i++) {
     const y = yBottom + Math.random() * (yTop - yBottom);
     const f = (y - (BODY_TOP + 0.3)) / 2.3;
     const rMax = 1.2 + (1.9 - 1.2) * f - 0.2; // follow cone radius
     const r = Math.sqrt(Math.random()) * Math.max(rMax, 0.1);
     const a = Math.random() * Math.PI * 2;
-    e.set(Math.random() * 6, Math.random() * 6, Math.random() * 6);
+    e.set(Math.random() * 6.283, Math.random() * 6.283, Math.random() * 6.283);
     q.setFromEuler(e);
-    m.compose(new THREE.Vector3(Math.cos(a) * r, y, Math.sin(a) * r), q, new THREE.Vector3(1, 1, 1));
+    const sz = 0.85 + Math.random() * 0.4;
+    m.compose(new THREE.Vector3(Math.cos(a) * r, y, Math.sin(a) * r), q,
+      new THREE.Vector3(sz * (0.95 + Math.random() * 0.1), sz, sz));
     mesh.setMatrixAt(i, m);
+    c.copy(dark).lerp(mid, Math.random());
+    mesh.setColorAt(i, c);
   }
+  mesh.instanceColor.needsUpdate = true;
   beans.add(mesh);
   beans.userData.mesh = mesh;
   return beans;
@@ -213,13 +242,14 @@ const statusEl = document.getElementById('status');
 
 // ---------- Simulation state ----------
 const GRIND_TIME = 3, REFILL_TIME = 1.5, GRIND_AMOUNT = 0.2, MAX_SPIN = 14; // rad/s
+const GROUNDS_FADE = 0.3, GROUNDS_PER_GRIND = 0.6; // old grounds fade time (s); bin fill of a full grind
 const state = {
   mode: 'idle',        // 'idle' | 'grinding' | 'refilling'
   t: 0,                // time within current action
   beansLevel: 1,
   groundsLevel: 0,
   from: 0, delta: 0,   // beans level at action start / change over the action
-  groundsFrom: 0,
+  groundsFrom: 0, groundsTarget: 0,
   spin: 0,             // current ring angle
 };
 const ease = x => x * x * (3 - 2 * x);
@@ -233,7 +263,7 @@ const beanBase = [];
   for (let i = 0; i < beanMesh.count; i++) {
     beanMesh.getMatrixAt(i, m);
     m.decompose(p, q, s);
-    beanBase.push({ p: p.clone(), q: q.clone(), h: 0 });
+    beanBase.push({ p: p.clone(), q: q.clone(), s: s.clone(), h: 0 });
     minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
   }
   for (const b of beanBase) b.h = (b.p.y - minY) / (maxY - minY);
@@ -245,14 +275,14 @@ function applyBeansLevel(level) {
   for (let i = 0; i < beanBase.length; i++) {
     const b = beanBase[i];
     const k = level <= 0 ? 0 : Math.min(1, Math.max(0, (level * (1 + soft) - b.h) / soft));
-    _s.setScalar(Math.max(k, 1e-5));
+    _s.copy(b.s).multiplyScalar(Math.max(k, 1e-5));
     _m.compose(b.p, b.q, _s);
     beanMesh.setMatrixAt(i, _m);
   }
   beanMesh.instanceMatrix.needsUpdate = true;
 }
-function applyGroundsLevel(level) {
-  grinder.groundsMesh.scale.y = Math.max(level * grinder.groundsMaxHeight, 0.0001);
+function applyGroundsLevel(level, radial = 1) {
+  grinder.groundsMesh.scale.set(radial, Math.max(level * grinder.groundsMaxHeight, 0.0001), radial);
 }
 
 // Falling ground particles through the chute (cheap Points, shown only while grinding).
@@ -278,11 +308,12 @@ function updateParticles(time) {
 }
 
 function startGrind() {
-  if (state.mode !== 'idle' || state.beansLevel <= 0 || state.groundsLevel >= 1) return;
+  if (state.mode !== 'idle' || state.beansLevel <= 0) return;
   state.mode = 'grinding'; state.t = 0;
   state.from = state.beansLevel;
-  state.groundsFrom = state.groundsLevel;
-  state.delta = Math.min(GRIND_AMOUNT, state.beansLevel, 1 - state.groundsLevel);
+  state.groundsFrom = state.groundsLevel; // old grounds, cleared at the start of this grind
+  state.delta = Math.min(GRIND_AMOUNT, state.beansLevel);
+  state.groundsTarget = GROUNDS_PER_GRIND * state.delta / GRIND_AMOUNT;
   particles.visible = true;
   refreshUI();
 }
@@ -296,14 +327,14 @@ function startRefill() {
 
 function refreshUI() {
   const idle = state.mode === 'idle';
-  const empty = state.beansLevel <= 0.0005, full = state.groundsLevel >= 0.9995;
-  grindBtn.disabled = !idle || empty || full;
+  const empty = state.beansLevel <= 0.0005;
+  grindBtn.disabled = !idle || empty;
   refillBtn.disabled = !idle || state.beansLevel >= 1;
   statusEl.textContent =
     state.mode === 'grinding' ? 'Grinding…' :
     state.mode === 'refilling' ? 'Refilling…' :
-    full ? 'Bin full' :
-    empty ? 'Hopper empty – refill' : 'Ready';
+    empty ? (state.groundsLevel > 0 ? 'Grounds ready – hopper empty, refill' : 'Hopper empty – refill') :
+    state.groundsLevel > 0 ? 'Grounds ready – grind again to replace' : 'Ready';
 }
 
 function update(dt, time) {
@@ -316,14 +347,22 @@ function update(dt, time) {
     shake = env;
     const prog = ease(p);
     state.beansLevel = state.from - state.delta * prog;
-    state.groundsLevel = state.groundsFrom + state.delta * prog;
     applyBeansLevel(state.beansLevel);
-    applyGroundsLevel(state.groundsLevel);
+    if (state.t < GROUNDS_FADE) { // old grounds vanish quickly
+      const f = ease(state.t / GROUNDS_FADE);
+      state.groundsLevel = state.groundsFrom * (1 - f);
+      applyGroundsLevel(state.groundsLevel, 1 - 0.3 * f);
+    } else { // new grounds rise from empty
+      const r = ease(Math.min(1, (state.t - GROUNDS_FADE) / (GRIND_TIME - GROUNDS_FADE)));
+      state.groundsLevel = state.groundsTarget * r;
+      applyGroundsLevel(state.groundsLevel);
+    }
     updateParticles(time);
     if (p >= 1) {
       state.mode = 'idle';
       state.beansLevel = Math.max(0, state.from - state.delta);
-      state.groundsLevel = Math.min(1, state.groundsFrom + state.delta);
+      state.groundsLevel = state.groundsTarget;
+      applyGroundsLevel(state.groundsLevel);
       particles.visible = false;
       refreshUI();
     }
