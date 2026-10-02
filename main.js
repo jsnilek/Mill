@@ -12,10 +12,10 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0xe9e6e1);
 
 const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 100);
-camera.position.set(5.5, 4.5, 7.5);
+camera.position.set(7.6, 6.6, 10.6); // pulled back a little so the refill bag stays in frame
 
 const controls = new OrbitControls(camera, canvas);
-controls.target.set(0, 2.2, 0);
+controls.target.set(0, 3.7, 0);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.minDistance = 4;
@@ -235,13 +235,103 @@ buildFloor();
 scene.add(grinder);
 window.grinder = grinder; // convenient for console / task 2
 
+// ---------- Coffee bag (procedural, shown only during Refill) ----------
+function makeBagTexture() {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 512;
+  const g = c.getContext('2d');
+  g.fillStyle = '#a77b4f'; g.fillRect(0, 0, 256, 512);
+  for (let i = 0; i < 900; i++) { // paper grain
+    g.fillStyle = `rgba(${60 + Math.random() * 60 | 0},40,20,${Math.random() * 0.08})`;
+    g.fillRect(Math.random() * 256, Math.random() * 512, 1 + Math.random() * 14, 1);
+  }
+  g.fillStyle = '#2a1a10'; g.fillRect(0, 190, 256, 170); // dark label band
+  g.fillStyle = '#f1e3c8'; g.font = 'bold 54px Arial, sans-serif';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText('COFFEE', 128, 250);
+  g.font = '22px Arial, sans-serif'; g.fillText('ARABICA  BEANS', 128, 305);
+  g.fillStyle = '#6b3d20'; g.beginPath(); g.ellipse(128, 410, 34, 22, -0.5, 0, 6.283); g.fill();
+  g.strokeStyle = '#d9c4a0'; g.lineWidth = 3; g.beginPath(); g.moveTo(104, 423); g.quadraticCurveTo(128, 400, 152, 397); g.stroke();
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 4;
+  return t;
+}
+// Pivot sits at the bag mouth (local origin); the bag hangs below it when upright.
+function buildBag() {
+  const pivot = new THREE.Group();
+  const H = 1.7, NECK = 0.25;
+  const paper = new THREE.MeshStandardMaterial({ map: makeBagTexture(), roughness: 0.9, side: THREE.DoubleSide });
+  const geo = new THREE.BoxGeometry(1.1, H, 0.62, 10, 16, 4);
+  const pos = geo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    let x = pos.getX(i); const y = pos.getY(i); let z = pos.getZ(i);
+    const t = (y + H / 2) / H; // 0 bottom .. 1 top
+    const pinch = Math.min(1, Math.max(0, (t - 0.65) / 0.35));
+    const ps = pinch * pinch * (3 - 2 * pinch);
+    const pillow = 0.55 + 0.45 * Math.sin(Math.PI * Math.min(1, t * 1.05 + 0.05)); // bulge mid-height
+    x *= (1 - 0.08 * t) * (1 - 0.64 * ps);
+    z *= pillow * (1 - 0.6 * ps);
+    z += Math.sin(x * 9 + y * 4) * 0.015 * (0.3 + t); // crinkles
+    x += Math.sin(y * 13 + z * 5) * 0.012;
+    pos.setXYZ(i, x, y, z);
+  }
+  geo.computeVertexNormals();
+  const bodyMesh = new THREE.Mesh(geo, paper);
+  bodyMesh.position.y = -NECK - H / 2 + 0.02;
+  bodyMesh.castShadow = true;
+  pivot.add(bodyMesh);
+  // open neck with a crinkled folded rim
+  const neckGeo = new THREE.CylinderGeometry(0.27, 0.22, NECK + 0.05, 20, 4, true);
+  const np = neckGeo.attributes.position;
+  for (let i = 0; i < np.count; i++) {
+    const a = Math.atan2(np.getZ(i), np.getX(i));
+    const k = 1 + 0.12 * Math.sin(a * 7 + np.getY(i) * 20) * (np.getY(i) > 0 ? 1 : 0.3);
+    np.setX(i, np.getX(i) * k); np.setZ(i, np.getZ(i) * k * 0.8);
+  }
+  neckGeo.computeVertexNormals();
+  const neck = new THREE.Mesh(neckGeo, new THREE.MeshStandardMaterial({ color: 0x9a7048, roughness: 0.95, side: THREE.DoubleSide }));
+  neck.position.y = -NECK / 2 + 0.02;
+  neck.castShadow = true;
+  pivot.add(neck);
+  const fold = new THREE.Mesh(new THREE.TorusGeometry(0.26, 0.035, 8, 24), new THREE.MeshStandardMaterial({ color: 0x8a6240, roughness: 1 }));
+  fold.rotation.x = Math.PI / 2; fold.scale.set(1, 0.8, 1);
+  pivot.add(fold);
+  pivot.visible = false;
+  return pivot;
+}
+const bag = buildBag();
+scene.add(bag);
+const BAG_AWAY = new THREE.Vector3(5.0, 8.2, 0.6);
+const BAG_HOVER = new THREE.Vector3(1.0, 6.4, 0);
+const BAG_POUR = new THREE.Vector3(0.45, 5.95, 0); // mouth position while pouring
+const mouthPos = new THREE.Vector3();
+// Choreography timeline (seconds): enter, tilt, pour, tilt back, leave (ends at REFILL_TIME).
+const T_ENTER = 0.7, T_TILT = 1.15, T_POUR_END = 2.1, T_BACK = 2.65;
+const POUR_ANGLE = 2.2;
+const seg = (t, a, b) => ease(Math.min(1, Math.max(0, (t - a) / (b - a))));
+function updateBag(t) {
+  const e = seg(t, 0, T_ENTER), tl = seg(t, T_ENTER, T_TILT), bk = seg(t, T_POUR_END, T_BACK), lv = seg(t, T_BACK, REFILL_TIME);
+  const pr = Math.min(1, Math.max(0, (t - T_TILT) / (T_POUR_END - T_TILT)));
+  bag.visible = true;
+  if (t < T_ENTER) bag.position.lerpVectors(BAG_AWAY, BAG_HOVER, e);
+  else if (t < T_POUR_END) bag.position.lerpVectors(BAG_HOVER, BAG_POUR, tl);
+  else if (t < T_BACK) bag.position.lerpVectors(BAG_POUR, BAG_HOVER, bk);
+  else bag.position.lerpVectors(BAG_HOVER, BAG_AWAY, lv);
+  if (t < T_POUR_END) bag.rotation.z = POUR_ANGLE * tl + 0.3 * pr + (pr > 0 ? 0.03 * Math.sin(t * 25) : 0);
+  else bag.rotation.z = (POUR_ANGLE + 0.3) * (1 - bk);
+  bag.scale.setScalar(t < T_ENTER ? 0.3 + 0.7 * e : 1 - 0.7 * lv);
+  mouthPos.copy(bag.position);
+}
+function hideBag() { bag.visible = false; }
+
 // ---------- UI ----------
 const grindBtn = document.getElementById('grind');
 const refillBtn = document.getElementById('refill');
 const statusEl = document.getElementById('status');
 
 // ---------- Simulation state ----------
-const GRIND_TIME = 3, REFILL_TIME = 1.5, GRIND_AMOUNT = 0.2, MAX_SPIN = 14; // rad/s
+const GRIND_TIME = 3, REFILL_TIME = 3.2, GRIND_AMOUNT = 0.2, MAX_SPIN = 14; // rad/s
 const GROUNDS_FADE = 0.3, GROUNDS_PER_GRIND = 0.6; // old grounds fade time (s); bin fill of a full grind
 const state = {
   mode: 'idle',        // 'idle' | 'grinding' | 'refilling'
@@ -276,7 +366,7 @@ const beanBase = [];
       y: p.y, tgt: p.y, k: 5 + Math.random() * 6, wait: 0, vel: 0, falling: false,
       axis: new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize(),
       omega: (Math.random() < 0.5 ? -1 : 1) * (1 + Math.random() * 1.5),
-      ph: Math.random() * 6.283,
+      ph: Math.random() * 6.283, stream: false, sx: 0, sz: 0, sy: 0,
     });
   }
 }
@@ -292,9 +382,13 @@ function stepBeans(dt, off = 0) {
     b.tgt = Y_BOT + Math.max(b.h - off, -0.2) * SPAN;
     if (b.wait > 0) { // refill bean still waiting above the hopper
       b.wait -= dt; moving = true; scale = 0;
+      if (b.wait <= 0) { // leaves the bag mouth now
+        b.stream = true; b.y = mouthPos.y - Math.random() * 0.1; b.vel = 0.5 + Math.random();
+        b.sx = mouthPos.x + (Math.random() - 0.5) * 0.18; b.sz = mouthPos.z + (Math.random() - 0.5) * 0.18;
+      }
     } else if (b.falling) {
       b.vel += 9 * dt; b.y -= b.vel * dt; moving = true;
-      if (b.y <= b.tgt) { b.y = b.tgt; b.falling = false; b.vel = 0; }
+      if (b.y <= b.tgt) { b.y = b.tgt; b.falling = false; b.vel = 0; b.stream = false; }
     } else {
       const d = b.tgt - b.y;
       if (Math.abs(d) > 5e-4) { b.y += d * (1 - Math.exp(-b.k * dt)); moving = true; }
@@ -311,6 +405,11 @@ function stepBeans(dt, off = 0) {
     let z = Math.sin(b.ang) * r0 + Math.cos(y * 11 + b.ph) * 0.035;
     const rr = Math.hypot(x, z);
     if (rr > lim) { x *= lim / rr; z *= lim / rr; }
+    if (b.stream) { // still in the stream from the bag mouth: blend into the pile column inside the hopper
+      const w = Math.min(1, Math.max(0, (BODY_TOP + 2.6 - y) / 1.0)), w2 = w * w * (3 - 2 * w);
+      x = b.sx + (x - b.sx) * w2;
+      z = b.sz + (z - b.sz) * w2;
+    }
     _qa.setFromAxisAngle(b.axis, y * b.omega);
     _q.copy(b.q0).multiply(_qa);
     _s.copy(b.s).multiplyScalar(Math.max(scale, 1e-5));
@@ -321,7 +420,7 @@ function stepBeans(dt, off = 0) {
   beansMoving = moving;
 }
 function snapBeans() { // jump to rest state
-  for (const b of beanBase) { b.y = Y_BOT + Math.max(b.h, -0.2) * SPAN; b.wait = 0; b.falling = false; }
+  for (const b of beanBase) { b.y = Y_BOT + Math.max(b.h, -0.2) * SPAN; b.wait = 0; b.falling = false; b.stream = false; }
   stepBeans(0);
 }
 function beginGrindBeans() { for (const b of beanBase) b.h0 = b.h; }
@@ -339,7 +438,7 @@ function beginRefillBeans() {
     b.gone = false;
     const slotY = Y_BOT + b.h * SPAN;
     b.y = Math.max(slotY, Y_TOP) + 0.4 + Math.random() * 1.0;
-    b.wait = (j / n) * 0.65 * REFILL_TIME + Math.random() * 0.08;
+    b.wait = T_TILT + 0.08 + (j / n) * (T_POUR_END - T_TILT - 0.15) + Math.random() * 0.05;
     b.falling = true; b.vel = 0;
     j++;
   }
@@ -437,8 +536,9 @@ function update(dt, time) {
     state.t += dt;
     const p = Math.min(state.t / REFILL_TIME, 1);
     state.beansLevel = state.from + state.delta * ease(p);
+    updateBag(state.t);
     stepBeans(dt);
-    if (p >= 1) { state.mode = 'idle'; state.beansLevel = 1; refreshUI(); }
+    if (p >= 1) { hideBag(); state.mode = 'idle'; state.beansLevel = 1; refreshUI(); }
   } else if (beansMoving) {
     stepBeans(dt); // let beans finish settling after the action ends
   }
