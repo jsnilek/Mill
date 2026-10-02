@@ -257,7 +257,8 @@ Object.assign(grinder, {
 buildLights();
 buildFloor();
 scene.add(grinder);
-window.grinder = grinder; // convenient for console / task 2
+window.grinder = grinder;
+window.millDebug = {}; // test hooks, filled below
 
 // ---------- Coffee bag (procedural, shown only during Refill) ----------
 function makeBagTexture() {
@@ -514,8 +515,129 @@ function updateParticles(time) {
   pGeo.attributes.position.needsUpdate = true;
 }
 
+// ---------- Overflow spill beans (separate small pool, reused) ----------
+const SPILL_N = 100, SPILL_REST = 1.2, SPILL_FADE = 2.2, SPILL_FLOOR = 0.07, SPILL_G = 9.8;
+const BAG_MIN_POUR = 0.09; // the bag always pours at least this much hopper level (~50 beans)
+const spillMesh = new THREE.InstancedMesh(beanMesh.geometry, beanMat, SPILL_N);
+spillMesh.castShadow = true;
+spillMesh.frustumCulled = false;
+const spillBeans = [];
+{
+  const dark = new THREE.Color(0x2a140a), mid = new THREE.Color(0x6b3d20), c = new THREE.Color();
+  const zero = new THREE.Matrix4().makeScale(1e-5, 1e-5, 1e-5);
+  for (let i = 0; i < SPILL_N; i++) {
+    spillBeans.push({
+      on: false, delay: 0, age: 0, landT: -1, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0,
+      q0: new THREE.Quaternion(), axis: new THREE.Vector3(1, 0, 0), ang: 0, om: 0, sz: 1,
+    });
+    spillMesh.setMatrixAt(i, zero);
+    c.copy(dark).lerp(mid, Math.random());
+    spillMesh.setColorAt(i, c);
+  }
+  spillMesh.instanceColor.needsUpdate = true;
+}
+scene.add(spillMesh);
+let spillQueue = []; // refill-time stamps at which the next overflow bean leaves the rim
+// Outer radius of the machine silhouette at height y (base, body, burr collar, hopper cone).
+function bodyRadius(y) {
+  if (y < 0.4) return 2.1 - 0.2 * (Math.max(y, 0) / 0.4);
+  if (y < BODY_TOP) return 1.6 - 0.25 * ((y - 0.4) / 2.6);
+  if (y < BODY_TOP + 0.3) return 1.4;
+  if (y < 5.7) return 1.2 + 0.7 * Math.min(1, (y - (BODY_TOP + 0.3)) / 2.3);
+  return 0;
+}
+function spawnSpill(delay) {
+  let b = spillBeans.find(o => !o.on);
+  if (!b) { b = spillBeans[0]; for (const o of spillBeans) if (o.age > b.age) b = o; } // recycle the oldest
+  const a = (Math.random() - 0.5) * 1.1; // on the bag side (+x)
+  const r = 2.0, out = 0.5 + Math.random() * 1.1;
+  b.on = true; b.delay = delay; b.age = 0; b.landT = -1;
+  b.x = Math.cos(a) * r; b.z = Math.sin(a) * r; b.y = 5.7 + Math.random() * 0.15;
+  b.vx = Math.cos(a) * out + (Math.random() - 0.5) * 0.3; b.vz = Math.sin(a) * out + (Math.random() - 0.5) * 0.3;
+  b.vy = 0.8 + Math.random() * 1.4;
+  b.q0.setFromEuler(new THREE.Euler(Math.random() * 6.283, Math.random() * 6.283, Math.random() * 6.283));
+  b.axis.set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
+  b.ang = 0; b.om = (Math.random() < 0.5 ? -1 : 1) * (4 + Math.random() * 6);
+  b.sz = 0.9 + Math.random() * 0.3;
+}
+let spillWasActive = false;
+function stepSpill(dt) {
+  let active = false;
+  for (let i = 0; i < SPILL_N; i++) {
+    const b = spillBeans[i];
+    let scale = 0;
+    if (b.on) {
+      active = true;
+      if (b.delay > 0) b.delay -= dt;
+      else {
+        b.age += dt;
+        b.vy -= SPILL_G * dt;
+        b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt;
+        b.ang += b.om * dt;
+        // keep outside the machine silhouette (slide down its outer surface)
+        const rb = bodyRadius(b.y) + 0.12;
+        if (rb > 0.12) {
+          const r = Math.hypot(b.x, b.z);
+          if (r < rb) {
+            if (r < 1e-4) { b.x = rb; b.z = 0; } else { b.x *= rb / r; b.z *= rb / r; }
+            const rr = Math.hypot(b.x, b.z), vr = (b.vx * b.x + b.vz * b.z) / rr;
+            if (vr < 0.2) { b.vx += (0.2 - vr) * b.x / rr; b.vz += (0.2 - vr) * b.z / rr; }
+          }
+        }
+        if (b.y < SPILL_FLOOR) {
+          b.y = SPILL_FLOOR;
+          if (b.landT < 0) b.landT = b.age;
+          if (b.vy < -0.8) { b.vy = -b.vy * 0.35; b.vx *= 0.7; b.vz *= 0.7; b.om *= 0.7; }
+          else b.vy = 0;
+        }
+        if (b.y <= SPILL_FLOOR + 1e-3 && b.vy === 0) { // rolling to rest
+          const f = Math.exp(-4 * dt); b.vx *= f; b.vz *= f; b.om *= Math.exp(-5 * dt);
+        }
+        scale = 1;
+        if (b.landT >= 0) {
+          const t = b.age - b.landT - SPILL_REST;
+          if (t >= SPILL_FADE) b.on = false;
+          else if (t > 0) scale = 1 - ease(t / SPILL_FADE);
+        }
+        if (b.age > 12) b.on = false; // safety
+        if (!b.on) scale = 0;
+      }
+    }
+    _qa.setFromAxisAngle(b.axis, b.ang);
+    _q.copy(b.q0).multiply(_qa);
+    _s.setScalar(Math.max(scale * b.sz, 1e-5));
+    _m.compose(_p.set(b.x, b.y, b.z), _q, _s);
+    spillMesh.setMatrixAt(i, _m);
+  }
+  if (active || spillWasActive) spillMesh.instanceMatrix.needsUpdate = true;
+  spillWasActive = active;
+}
+
+function finishGrind() { // end-of-grind handler (also used to fast-forward)
+  state.mode = 'idle';
+  state.beansLevel = Math.max(0, state.from - state.delta);
+  endGrindBeans(state.delta);
+  state.groundsLevel = state.groundsTarget;
+  applyGroundsLevel(state.groundsLevel);
+  particles.visible = false;
+  refreshUI();
+}
+function finishRefill() { // end-of-refill handler (also used to fast-forward)
+  hideBag(); resetLid();
+  state.mode = 'idle';
+  state.beansLevel = 1;
+  snapBeans(); // all beans to their rest slots
+  for (let i = 0; i < spillQueue.length; i++) spawnSpill(Math.random() * 0.4); // remaining overflow leaves now
+  spillQueue = [];
+  refreshUI();
+}
+// Buttons are always live: a new action first fast-forwards the running one to its end state.
+function finishCurrent() {
+  if (state.mode === 'grinding') finishGrind();
+  else if (state.mode === 'refilling') finishRefill();
+}
 function startGrind() {
-  if (state.mode !== 'idle') return;
+  finishCurrent();
   state.mode = 'grinding'; state.t = 0;
   state.from = Math.max(0, state.beansLevel);
   state.groundsFrom = state.groundsLevel; // old grounds, cleared at the start of this grind
@@ -527,19 +649,21 @@ function startGrind() {
   refreshUI();
 }
 function startRefill() {
-  if (state.mode !== 'idle' || state.beansLevel >= 1) return;
+  finishCurrent();
   state.mode = 'refilling'; state.t = 0;
-  state.from = state.beansLevel;
-  state.delta = 1 - state.beansLevel;
+  state.from = Math.min(1, Math.max(0, state.beansLevel));
+  state.delta = 1 - state.from;
+  const pour = Math.max(state.delta, BAG_MIN_POUR);
+  const spillN = Math.round((pour - state.delta) * beanBase.length); // what does not fit over the rim
+  const t0 = BAG_START + T_TILT + 0.15, t1 = BAG_START + T_POUR_END;
+  spillQueue = [];
+  for (let i = 0; i < spillN; i++) spillQueue.push(t0 + (i / spillN) * (t1 - t0));
   beginRefillBeans();
   refreshUI();
 }
 
 function refreshUI() {
-  const idle = state.mode === 'idle';
   const empty = state.beansLevel <= 0.0005;
-  grindBtn.disabled = !idle;
-  refillBtn.disabled = !idle || state.beansLevel >= 1;
   statusEl.textContent =
     state.mode === 'grinding' ? 'Grinding…' :
     state.mode === 'refilling' ? 'Refilling…' :
@@ -568,15 +692,7 @@ function update(dt, time) {
       applyGroundsLevel(state.groundsLevel);
     }
     if (state.delta > 0) updateParticles(time);
-    if (p >= 1) {
-      state.mode = 'idle';
-      state.beansLevel = Math.max(0, state.from - state.delta);
-      endGrindBeans(state.delta);
-      state.groundsLevel = state.groundsTarget;
-      applyGroundsLevel(state.groundsLevel);
-      particles.visible = false;
-      refreshUI();
-    }
+    if (p >= 1) finishGrind();
   } else if (state.mode === 'refilling') {
     state.t += dt;
     const p = Math.min(state.t / REFILL_TIME, 1);
@@ -584,10 +700,12 @@ function update(dt, time) {
     updateLid(state.t);
     updateBag(state.t);
     stepBeans(dt);
-    if (p >= 1) { hideBag(); resetLid(); state.mode = 'idle'; state.beansLevel = 1; refreshUI(); }
+    while (spillQueue.length && spillQueue[0] <= state.t) { spillQueue.shift(); spawnSpill(0); }
+    if (p >= 1) finishRefill();
   } else if (beansMoving) {
     stepBeans(dt); // let beans finish settling after the action ends
   }
+  stepSpill(dt);
   state.spin += spinSpeed * dt;
   grinder.burrs.userData.ring.rotation.y = state.spin;
   // tiny vibration of the whole machine
@@ -596,6 +714,7 @@ function update(dt, time) {
   grinder.rotation.z = shake * 0.003 * Math.sin(time * 61);
 }
 
+Object.assign(window.millDebug, { state, spillBeans, beanBase, bag, lid, update, render: () => renderer.render(scene, camera), pause: () => renderer.setAnimationLoop(null) });
 grindBtn.addEventListener('click', startGrind);
 refillBtn.addEventListener('click', startRefill);
 snapBeans();
